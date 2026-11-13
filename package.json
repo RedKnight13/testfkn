@@ -1,12 +1,14 @@
 {
   "name": "fkn-test",
   "private": true,
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "build": "node build.mjs && cp dist/index.html dist/sw.js .",
     "test": "node build.mjs && python3 test/run.py"
   },
   "devDependencies": {
+    "@noble/curves": "2.0.1",
+    "@noble/hashes": "2.0.1",
     "esbuild": "^0.28.0",
     "nostr-tools": "^2.26.0",
     "ws": "^8.18.0"

@@ -1,13 +1,18 @@
 // FKN test build. One page is the whole app.
 // - Identity is twelve words; every key is derived from them in the browser.
-// - A network is a key. Its host signs the list of seated members.
+// - A network is a key. Its host hands out blind seat tokens: the host approves
+//   a person without learning which handle that person will use.
+// - A handle with a valid seat certificate is a member. Nobody keeps a member list.
 // - Rooms, messages, polls and long posts are signed notes held by open relays.
 // - Every browser shows only notes from seated members.
-import { getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
+import { generateSecretKey, getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
 import { generateSeedWords, validateWords, privateKeyFromSeedWords } from 'nostr-tools/nip06';
+import { seatSecret, seatPublic, blindSeat, signBlinded, unblindSeat, signSeat, verifySeat } from './seat.js';
 
-const K_MSG = 4270, K_JOIN = 4271, K_ROOM = 4272, K_POST = 4273, K_POLL = 4274, K_VOTE = 4275, K_ROSTER = 30078;
-const NOTE_KINDS = [K_MSG, K_JOIN, K_ROOM, K_POST, K_POLL, K_VOTE];
+const K_MSG = 4270, K_JOIN = 4271, K_ROOM = 4272, K_POST = 4273, K_POLL = 4274, K_VOTE = 4275, K_GRANT = 4276, K_SEAT = 4277, K_NET = 30078;
+const NOTE_KINDS = [K_MSG, K_JOIN, K_ROOM, K_POST, K_POLL, K_VOTE, K_GRANT, K_SEAT];
+const MEMBER_KINDS = [K_MSG, K_ROOM, K_POST, K_POLL, K_VOTE];
+const HEX96 = /^[0-9a-f]{96}$/, HEX192 = /^[0-9a-f]{192}$/;
 const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net'];
 const NAME_RE = /^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -19,6 +24,9 @@ const fromHex = (s) => new Uint8Array(s.match(/.{2}/g).map((x) => parseInt(x, 16
 const now = () => Math.floor(Date.now() / 1000);
 const tagVal = (ev, name, marker) => { const t = (ev.tags || []).find((x) => Array.isArray(x) && x[0] === name && (marker === undefined || x[2] === marker)); return t ? t[1] : null; };
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+// A seat certificate covers a handle and its name together, so the name is locked for the whole era.
+const subject = (pk, name) => pk + '|' + name;
+const codeOf = (pk) => pk.slice(0, 4) + '-' + pk.slice(4, 8);
 
 const mem = {};
 const store = {
@@ -40,6 +48,12 @@ function h(tag, attrs, ...kids) {
     e.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return e;
+}
+
+function stamp(ms) {
+  const d = new Date(ms), ts = Math.floor(ms / 1000);
+  const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  return d.toDateString() === new Date().toDateString() ? hm : when(ts) + ', ' + hm;
 }
 
 function when(ts) {
@@ -100,16 +114,22 @@ class Pool {
 // ---------- state ----------
 
 const S = {
-  cfg: null, T: '', words: '', sk: null, pk: '', hostSk: null, hostPk: '', isHost: false, pool: null,
-  roster: null, rosterDeadline: 0,
-  seen: new Set(), queue: [], limbo: new Map(), draining: false, joinsChecked: 0,
-  byId: new Map(), rooms: [], posts: [], byRoot: new Map(), polls: new Map(), votes: new Map(), joins: new Map(),
+  cfg: null, T: '', words: '', sk: null, pk: '', hostSk: null, hostPk: '', isHost: false, seatSk: null, pool: null, fast: false,
+  net: null, netDeadline: 0,                       // { at, id, name, seatKey, era }
+  members: new Map(), names: new Map(),           // handle -> { name, at, id }; handle -> shown name
+  claims: [], claiming: false, badClaims: 0, certOk: new Set(),
+  requests: new Map(), grants: new Map(), sideChecked: 0,   // seat requests and the host's blind grants
+  pending: null, claimTimer: null,                // my own seat request in flight
+  seen: new Set(), queue: [], limbo: new Map(), draining: false,
+  byId: new Map(), rooms: [], posts: [], byRoot: new Map(), polls: new Map(), votes: new Map(),
   ignored: new Set(), muted: new Set(), follow: new Set(), lastSeen: {},
-  reply: null, lastSent: 0, readFilter: 'all',
+  reply: null, lastSent: 0, readFilter: 'all', edition: '', editionAt: 0, quiet: false,
 };
 
-const memberOf = (pk) => (S.roster ? S.roster.members[pk] : null);
-const nameOf = (pk) => { const m = memberOf(pk); return m ? m.name : 'unknown'; };
+const memberOf = (pk) => (S.members.has(pk) ? { name: S.names.get(pk) } : null);
+// Quiet reading: this device contacts no relay, so it can read but not speak.
+const canSpeak = () => S.members.has(S.pk) && !S.quiet;
+const nameOf = (pk) => S.names.get(pk) || 'unknown';
 const visible = (ev) => !!memberOf(ev.pubkey) && !S.muted.has(ev.pubkey);
 const saveSet = (key, set) => store.set(key + '.' + S.cfg.s, JSON.stringify([...set]));
 
@@ -131,47 +151,189 @@ function loadIdentity() {
 function incoming(ev) {
   if (!ev || typeof ev.id !== 'string' || S.seen.has(ev.id)) return;
   if (typeof ev.content !== 'string' || ev.content.length > MAX.any || typeof ev.pubkey !== 'string') return;
-  if (ev.kind === K_ROSTER) { S.seen.add(ev.id); takeRoster(ev); return; }
+  if (ev.kind === K_NET) { S.seen.add(ev.id); takeNet(ev); return; }
   if (!NOTE_KINDS.includes(ev.kind) || tagVal(ev, 't') !== S.T) return;
   S.seen.add(ev.id);
-  S.queue.push(ev);
-  drain();
+  if (ev.kind === K_SEAT) { S.claims.push(ev); drainClaims(); }
+  else if (ev.kind === K_JOIN || ev.kind === K_GRANT) takeSide(ev);
+  else { S.queue.push(ev); drain(); }
 }
 
-function takeRoster(ev) {
-  if (ev.pubkey !== S.cfg.s || tagVal(ev, 'd') !== 'fkn:roster') return;
-  if (S.roster && !(ev.created_at > S.roster.at || (ev.created_at === S.roster.at && ev.id < S.roster.id))) return;
+// The network's own note: its name and the public key that seat certificates are checked against.
+function takeNet(ev) {
+  if (ev.pubkey !== S.cfg.s || tagVal(ev, 'd') !== 'fkn:net') return;
+  if (S.net && !(ev.created_at > S.net.at || (ev.created_at === S.net.at && ev.id < S.net.id))) return;
   let ok = false; try { ok = verifyEvent(ev); } catch (e) { ok = false; }
   if (!ok) return;
   let body; try { body = JSON.parse(ev.content); } catch (e) { return; }
-  if (!body || typeof body.members !== 'object' || body.members === null) return;
-  const members = {};
-  for (const [pk, m] of Object.entries(body.members)) {
-    if (HEX64.test(pk) && m && NAME_RE.test(m.name || '')) members[pk] = { name: m.name };
-  }
-  S.roster = { at: ev.created_at, id: ev.id, name: clip(String(body.name || 'FKN'), 40), members };
-  // Notes that arrived before their author had a seat get a second look.
-  for (const pk of Object.keys(members)) {
-    const held = S.limbo.get(pk);
-    if (held) { S.queue.push(...held); S.limbo.delete(pk); }
-  }
-  drain(); scheduleRefresh();
+  if (!body || !HEX192.test(body.seatKey || '')) return;
+  const era = Number.isInteger(body.era) && body.era > 0 ? body.era : 1;
+  if (S.net && (S.net.seatKey !== body.seatKey || S.net.era !== era)) { S.members.clear(); S.names.clear(); }
+  S.net = { at: ev.created_at, id: ev.id, name: clip(String(body.name || 'FKN'), 40), seatKey: body.seatKey, era, ev };
+  drainClaims(); checkPending(); drain(); scheduleRefresh();
 }
 
+// Seat claims: a handle shows its certificate. Checked one per tick, because the check is heavy.
+function drainClaims() {
+  if (S.claiming || !S.net) return;
+  S.claiming = true;
+  const step = () => {
+    const ev = S.claims.shift();
+    if (!ev) { S.claiming = false; return; }
+    acceptClaim(ev);
+    setTimeout(step, 0);
+  };
+  step();
+}
+
+function acceptClaim(ev) {
+  let body; try { body = JSON.parse(ev.content); } catch (e) { return; }
+  if (!body || !NAME_RE.test(body.name || '') || !HEX96.test(body.cert || '')) return;
+  const prev = S.members.get(ev.pubkey);   // a handle's first claim fixes its name
+  if (prev && (prev.at < ev.created_at || (prev.at === ev.created_at && prev.id <= ev.id))) return;
+  let ok = false; try { ok = verifyEvent(ev); } catch (e) { ok = false; }
+  if (!ok) return;
+  const key = subject(ev.pubkey, body.name) + '|' + body.cert + '|' + S.net.era + '|' + S.net.seatKey.slice(0, 16);
+  if (!S.certOk.has(key)) {
+    if (S.badClaims > 300) return;
+    if (!verifySeat(body.cert, S.net.era, subject(ev.pubkey, body.name), S.net.seatKey)) { S.badClaims += 1; return; }
+    S.certOk.add(key);
+    store.set('fkn.certok.' + S.cfg.s, JSON.stringify([...S.certOk].slice(-2000)));
+  }
+  S.members.set(ev.pubkey, { name: body.name, at: ev.created_at, id: ev.id, ev });
+  // Two handles may pick the same name. Then every holder of it gets a short tail, so nobody can pass as another.
+  const count = new Map();
+  for (const m of S.members.values()) count.set(m.name, (count.get(m.name) || 0) + 1);
+  S.names.clear();
+  for (const [pk, m] of S.members) S.names.set(pk, count.get(m.name) > 1 ? m.name + '~' + pk.slice(0, 4) : m.name);
+  // Notes that arrived before their author was seated get a second look.
+  const held = S.limbo.get(ev.pubkey);
+  if (held) { S.queue.push(...held); S.limbo.delete(ev.pubkey); drain(); }
+  if (ev.pubkey === S.pk && S.pending) { S.pending = null; store.set('fkn.pending.' + S.cfg.s, 'null'); }
+  scheduleRefresh();
+}
+
+// Seat requests (from throwaway keys) and the host's blind grants.
+function takeSide(ev) {
+  const mine = S.pending && S.pending.reqId;
+  if (ev.kind === K_JOIN) {
+    if (!S.isHost || S.requests.size > 500) return;                 // only the host needs these
+    let body; try { body = JSON.parse(ev.content); } catch (e) { return; }
+    if (!body || !HEX96.test(body.blind || '')) return;
+    S.sideChecked += 1; if (S.sideChecked > 1500) return;
+    let ok = false; try { ok = verifyEvent(ev); } catch (e) { ok = false; }
+    if (ok) S.requests.set(ev.id, { pubkey: ev.pubkey, blind: body.blind, at: ev.created_at });
+  } else {
+    const reqId = tagVal(ev, 'e');
+    if (ev.pubkey !== S.cfg.s || !HEX64.test(reqId || '')) return;
+    if (!S.isHost && reqId !== mine) return;                        // only the asker and the host need these
+    let body; try { body = JSON.parse(ev.content); } catch (e) { return; }
+    if (!body || !HEX96.test(body.signed || '')) return;
+    let ok = false; try { ok = verifyEvent(ev); } catch (e) { ok = false; }
+    if (ok) { S.grants.set(reqId, body.signed); checkPending(); }
+  }
+  scheduleRefresh();
+}
+
+// My own request: when the grant arrives, remove the blinding, check the certificate, then claim the seat.
+function checkPending() {
+  const p = S.pending;
+  if (!p || !S.net || S.quiet || S.members.has(S.pk)) return;
+  if (!p.cert) {
+    const signed = S.grants.get(p.reqId);
+    if (!signed) return;
+    let cert = ''; try { cert = unblindSeat(signed, p.r); } catch (e) { return; }
+    if (!verifySeat(cert, S.net.era, subject(S.pk, p.name), S.net.seatKey)) return;
+    p.cert = cert;
+    // Claim at a minute mark plus a little noise, so claims from several people land together.
+    // A mark less than 20 seconds away is skipped: a claim right after its grant would give the link away.
+    const mark = Math.floor(now() / 60) + 1;
+    p.due = S.fast ? 0 : (mark * 60 - now() < 20 ? mark + 1 : mark) * 60 + Math.floor(Math.random() * 15);
+    store.set('fkn.pending.' + S.cfg.s, JSON.stringify(p));
+  }
+  if (!S.claimTimer) {
+    S.claimTimer = setTimeout(() => {
+      S.claimTimer = null;
+      if (S.pending && S.pending.cert && !S.members.has(S.pk)) publishClaim(S.pending.name, S.pending.cert);
+    }, Math.max(0, p.due * 1000 - Date.now()));
+  }
+  scheduleRefresh();
+}
+
+function publishClaim(name, cert) {
+  const ev = finalizeEvent({ kind: K_SEAT, created_at: now(), tags: [['t', S.T]], content: JSON.stringify({ name, cert }) }, S.sk);
+  S.seen.add(ev.id); S.claims.push(ev); drainClaims();
+  S.pool.publish(ev);
+}
+
+function askForSeat(name) {
+  const reqSk = generateSecretKey();
+  const { blinded, r } = blindSeat(S.net.era, subject(S.pk, name));
+  const ev = finalizeEvent({ kind: K_JOIN, created_at: now(), tags: [['t', S.T]], content: JSON.stringify({ blind: blinded }) }, reqSk);
+  S.pending = { reqId: ev.id, code: codeOf(ev.pubkey), r, name };
+  store.set('fkn.pending.' + S.cfg.s, JSON.stringify(S.pending));
+  S.seen.add(ev.id);
+  S.pool.publish(ev);
+  scheduleRefresh();
+}
+
+// Host: sign the blinded point for a request. The host cannot tell which handle it will become.
+function grantSeat(reqId) {
+  const req = S.requests.get(reqId);
+  if (!req) return;
+  let signed = ''; try { signed = signBlinded(req.blind, S.seatSk); } catch (e) { S.ignored.add(reqId); scheduleRefresh(); return; }
+  const ev = finalizeEvent({ kind: K_GRANT, created_at: now(), tags: [['t', S.T], ['e', reqId], ['p', req.pubkey]], content: JSON.stringify({ signed }) }, S.hostSk);
+  S.seen.add(ev.id); S.grants.set(reqId, signed);
+  S.pool.publish(ev);
+  scheduleRefresh();
+}
+
+function publishNet(name) {
+  const at = Math.max(now(), (S.net ? S.net.at : 0) + 1);
+  const ev = finalizeEvent({ kind: K_NET, created_at: at, tags: [['d', 'fkn:net']], content: JSON.stringify({ name, seatKey: seatPublic(S.seatSk), era: 1 }) }, S.hostSk);
+  store.set('fkn.net.' + S.cfg.s, JSON.stringify(ev));
+  S.seen.add(ev.id); takeNet(ev);
+  S.pool.publish(ev);
+}
+
+// An edition is one file of signed notes. Each note in it is checked like any other,
+// so it does not matter where the file came from: the site, a mirror, or a messenger.
+function loadEdition(j) {
+  if (!j || !Array.isArray(j.events)) return 'That file is not an edition.';
+  if (j.network && j.network !== S.cfg.s) return 'That edition belongs to another network.';
+  const built = Date.parse(j.built);
+  if (built && built > S.editionAt && built < Date.now() + 600000) { S.editionAt = built; S.edition = stamp(built); }
+  j.events.slice(0, 20000).forEach(incoming);
+  scheduleRefresh();
+  return '';
+}
+
+function saveEdition() {
+  const events = [S.net.ev, ...[...S.members.values()].map((m) => m.ev), ...S.byId.values()]
+    .sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1));
+  const built = new Date();
+  const blob = new Blob([JSON.stringify({ v: 1, network: S.cfg.s, built: built.toISOString(), count: events.length, events })], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: 'edition-' + built.toISOString().slice(0, 16).replace(/[-:T]/g, '') + '.json' });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 20000);
+  return events.length;
+}
+
+// Ordinary notes from members.
 function drain() {
   if (S.draining) return;
   S.draining = true;
   const step = () => {
-    if (!S.roster && Date.now() < S.rosterDeadline) { setTimeout(step, 150); return; }
+    if (!S.net && Date.now() < S.netDeadline) { setTimeout(step, 150); return; }
     let n = 0;
     while (S.queue.length && n < 20) {
       const ev = S.queue.shift(); n += 1;
-      if (ev.kind !== K_JOIN && !memberOf(ev.pubkey)) {
+      if (!S.members.has(ev.pubkey)) {
         const held = S.limbo.get(ev.pubkey) || [];
         if (held.length < 200 && S.limbo.size < 500) { held.push(ev); S.limbo.set(ev.pubkey, held); }
         continue;
       }
-      if (ev.kind === K_JOIN) { S.joinsChecked += 1; if (S.joinsChecked > 400) continue; }
       let ok = false; try { ok = verifyEvent(ev); } catch (e) { ok = false; }
       if (ok) take(ev);
     }
@@ -184,13 +346,8 @@ function drain() {
 function take(ev) {
   if (S.byId.has(ev.id)) return;
   let body = null;
+  if (!MEMBER_KINDS.includes(ev.kind)) return;
   if (ev.kind !== K_MSG && ev.kind !== K_VOTE) { try { body = JSON.parse(ev.content); } catch (e) { return; } if (!body || typeof body !== 'object') return; }
-  if (ev.kind === K_JOIN) {
-    if (!NAME_RE.test(body.name || '')) return;
-    const prev = S.joins.get(ev.pubkey);
-    if (!prev || ev.created_at >= prev.at) S.joins.set(ev.pubkey, { name: body.name, at: ev.created_at });
-    return;
-  }
   if (ev.kind === K_ROOM) {
     const title = String(body.title || '').trim();
     if (!title || title.length > MAX.title) return;
@@ -219,30 +376,13 @@ function take(ev) {
   S.byId.set(ev.id, ev);
 }
 
-function sign(kind, tags, content, sk) {
-  const ev = finalizeEvent({ kind, created_at: now(), tags: [['t', S.T], ...tags], content }, sk || S.sk);
+function sign(kind, tags, content) {
+  const ev = finalizeEvent({ kind, created_at: now(), tags: [['t', S.T], ...tags], content }, S.sk);
   S.seen.add(ev.id);
-  if (kind === K_JOIN || memberOf(ev.pubkey)) take(ev);
+  if (S.members.has(S.pk)) take(ev);
   S.pool.publish(ev);
   scheduleRefresh();
   return ev;
-}
-
-function publishRoster(name, members) {
-  const at = Math.max(now(), (S.roster ? S.roster.at : 0) + 1);
-  const ev = finalizeEvent({ kind: K_ROSTER, created_at: at, tags: [['d', 'fkn:roster']], content: JSON.stringify({ name, members }) }, S.hostSk);
-  store.set('fkn.roster.' + S.cfg.s, JSON.stringify(ev));
-  S.seen.add(ev.id); takeRoster(ev);
-  S.pool.publish(ev);
-}
-
-function seat(pubkey, wanted) {
-  const members = Object.assign({}, S.roster ? S.roster.members : {});
-  const taken = new Set(Object.values(members).map((m) => m.name));
-  let name = wanted, n = 2;
-  while (taken.has(name)) { name = wanted.slice(0, 16) + '-' + n; n += 1; }
-  members[pubkey] = { name };
-  publishRoster(S.roster ? S.roster.name : 'FKN', members);
 }
 
 // ---------- routing ----------
@@ -282,10 +422,11 @@ function scheduleRefresh() {
   requestAnimationFrame(() => {
     refreshQueued = false;
     if (!S.cfg) return;
-    el.name.textContent = S.roster ? S.roster.name : 'FKN';
+    el.name.textContent = S.net ? S.net.name : 'FKN';
     document.title = el.name.textContent;
     const open = S.pool.open.size, total = S.pool.urls.length;
-    el.status.textContent = open ? 'Connected to ' + open + ' of ' + total + ' hosts' : 'Connecting to hosts';
+    el.status.textContent = S.quiet ? 'Quiet reading. ' + (S.edition ? 'Edition from ' + S.edition : 'No edition on this device yet')
+      : open ? 'Connected to ' + open + ' of ' + total + ' hosts' : (S.edition ? 'No host reachable. Showing the edition from ' + S.edition : 'Connecting to hosts');
     if (V.key && V.key() !== V.k0) { mount(); return; }
     if (V.refresh) V.refresh();
   });
@@ -313,10 +454,12 @@ function mount() {
   window.scrollTo(0, 0);
 }
 
-const seatKey = () => (memberOf(S.pk) ? 'member' : 'reader');
+const seatKey = () => (canSpeak() ? 'member' : 'reader');
 const backTo = (v, label) => h('button', { class: 'back', id: 'back', onclick: () => go(v) }, '‹ ' + label);
-const needSeat = () => h('div', { class: 'card pad' }, h('p', {}, 'You are reading. Take a seat to speak.'),
-  h('div', { class: 'row' }, h('button', { class: 'primary', id: 'toseat', onclick: () => go('you') }, 'Take a seat')));
+const needSeat = () => (S.quiet
+  ? h('div', { class: 'card pad', id: 'quietnote' }, h('p', {}, 'Quiet reading is on. Turn it off under You to speak.'))
+  : h('div', { class: 'card pad' }, h('p', {}, 'You are reading. Take a seat to speak.'),
+    h('div', { class: 'row' }, h('button', { class: 'primary', id: 'toseat', onclick: () => go('you') }, 'Take a seat'))));
 
 // --- threads: messages and polls under a room or a post ---
 
@@ -328,7 +471,7 @@ function fillThread(list, rootId) {
   const parentOf = (x) => (x.ev ? tagVal(x.ev, 'e', 'reply') : null);
   const items = msgs.concat(polls).sort((a, b) => a.at - b.at || (parentOf(a) === b.id ? 1 : parentOf(b) === a.id ? -1 : (a.id < b.id ? -1 : 1))).slice(-300);
   list.textContent = '';
-  if (!S.roster) list.append(h('p', { class: 'muted empty' }, 'Looking for this network'));
+  if (!S.net) list.append(h('p', { class: 'muted empty' }, 'Looking for this network'));
   else if (!items.length) list.append(h('p', { class: 'muted empty' }, 'Nothing here yet. Say something worth reading.'));
   for (const it of items) list.append(it.poll ? pollCard(it.poll) : msgRow(it.ev));
   if (atBottom) list.scrollTop = list.scrollHeight;
@@ -341,7 +484,7 @@ function msgRow(ev) {
   if (parent && visible(parent)) row.append(h('p', { class: 'quote' }, nameOf(parent.pubkey) + ': ' + clip(parent.content, 90)));
   row.append(h('p', { class: 'text' }, ev.content));
   const acts = h('div', { class: 'acts' });
-  if (memberOf(S.pk)) acts.append(h('button', { class: 'link reply', onclick: () => setReply(ev) }, 'Reply'));
+  if (canSpeak()) acts.append(h('button', { class: 'link reply', onclick: () => setReply(ev) }, 'Reply'));
   if (!own) acts.append(h('button', { class: 'link mute', onclick: () => { S.muted.add(ev.pubkey); saveSet('fkn.mute', S.muted); scheduleRefresh(); } }, 'Mute'));
   if (own && S.pool.outbox.has(ev.id)) {
     const held = (S.pool.acks.get(ev.id) || new Set()).size, why = S.pool.refused.get(ev.id);
@@ -359,7 +502,7 @@ function pollCard(p) {
   const card = h('div', { class: 'poll' }, h('p', { class: 'who' }, nameOf(p.pubkey), h('span', { class: 'muted time' }, 'asks · ' + when(p.at))), h('p', { class: 'text' }, p.q));
   p.options.forEach((opt, i) => {
     const label = opt + ' · ' + counts[i] + (mine && mine.i === i ? ' · your vote' : '');
-    if (memberOf(S.pk)) card.append(h('button', { class: 'opt' + (mine && mine.i === i ? ' chosen' : ''), onclick: () => sign(K_VOTE, [['e', p.id, 'poll']], String(i)) }, label));
+    if (canSpeak()) card.append(h('button', { class: 'opt' + (mine && mine.i === i ? ' chosen' : ''), onclick: () => sign(K_VOTE, [['e', p.id, 'poll']], String(i)) }, label));
     else card.append(h('p', { class: 'opt static' }, label));
   });
   card.append(h('p', { class: 'muted small' }, total + (total === 1 ? ' person voted' : ' people voted') + '. One seat, one vote.'));
@@ -417,7 +560,7 @@ function composer(rootId, withPolls) {
 function viewRooms() {
   const list = h('div', { class: 'card', id: 'rooms' });
   el.view.append(h('div', { class: 'row between' }, h('h2', {}, 'Rooms'),
-    memberOf(S.pk) ? h('button', { id: 'newroom', onclick: () => go('newroom') }, 'New room') : null), list);
+    canSpeak() ? h('button', { id: 'newroom', onclick: () => go('newroom') }, 'New room') : null), list);
   return {
     key: seatKey,
     refresh() {
@@ -428,7 +571,7 @@ function viewRooms() {
         return { r, last, fresh: msgs.filter((m) => m.created_at > seenAt && m.pubkey !== S.pk).length };
       }).sort((a, b) => b.last - a.last);
       list.textContent = '';
-      if (!S.roster) list.append(h('p', { class: 'muted empty' }, S.pool.open.size ? 'Looking for this network' : 'Connecting'));
+      if (!S.net) list.append(h('p', { class: 'muted empty' }, S.quiet ? 'No edition on this device yet. Open one under You.' : S.pool.open.size ? 'Looking for this network' : 'Connecting'));
       else if (!rooms.length) list.append(h('p', { class: 'muted empty' }, 'No rooms yet.'));
       for (const { r, last, fresh } of rooms) {
         list.append(h('button', { class: 'item room', onclick: () => go('room', r.id) },
@@ -441,8 +584,8 @@ function viewRooms() {
 }
 
 function viewNewRoom() {
-  if (!memberOf(S.pk)) { el.view.append(backTo('rooms', 'Rooms'), needSeat()); return { key: seatKey }; }
-  const title = h('input', { type: 'text', maxlength: String(MAX.title), placeholder: 'Bengaluru water', 'aria-label': 'Room name', id: 'roomtitle' });
+  if (!canSpeak()) { el.view.append(backTo('rooms', 'Rooms'), needSeat()); return { key: seatKey }; }
+  const title = h('input', { type: 'text', maxlength: String(MAX.title), placeholder: 'Water supply', 'aria-label': 'Room name', id: 'roomtitle' });
   const about = h('input', { type: 'text', maxlength: String(MAX.about), placeholder: 'What is this room for?', 'aria-label': 'What is this room for', id: 'roomabout' });
   const err = h('p', { class: 'error small' });
   const create = () => {
@@ -460,7 +603,7 @@ function viewNewRoom() {
 
 function viewRoom(id) {
   const head = h('div', {}), list = h('div', { class: 'card thread', id: 'messages' });
-  el.view.append(backTo('rooms', 'Rooms'), head, list, memberOf(S.pk) && id ? composer(id, true) : needSeat());
+  el.view.append(backTo('rooms', 'Rooms'), head, list, canSpeak() && id ? composer(id, true) : needSeat());
   return {
     key: seatKey,
     refresh() {
@@ -483,7 +626,7 @@ function viewReading() {
   const all = h('button', { class: 'chip', id: 'f-all', onclick: () => { S.readFilter = 'all'; scheduleRefresh(); } }, 'All');
   const fol = h('button', { class: 'chip', id: 'f-following', onclick: () => { S.readFilter = 'following'; scheduleRefresh(); } }, 'Following');
   el.view.append(h('div', { class: 'row between' }, h('h2', {}, 'Reading'),
-    memberOf(S.pk) ? h('button', { id: 'write', onclick: () => go('write') }, 'Write') : null), h('div', { class: 'row chips' }, all, fol), list);
+    canSpeak() ? h('button', { id: 'write', onclick: () => go('write') }, 'Write') : null), h('div', { class: 'row chips' }, all, fol), list);
   return {
     key: seatKey,
     refresh() {
@@ -500,7 +643,7 @@ function viewReading() {
 }
 
 function viewWrite() {
-  if (!memberOf(S.pk)) { el.view.append(backTo('reading', 'Reading'), needSeat()); return { key: seatKey }; }
+  if (!canSpeak()) { el.view.append(backTo('reading', 'Reading'), needSeat()); return { key: seatKey }; }
   const title = h('input', { type: 'text', maxlength: String(MAX.postTitle), placeholder: 'Title', 'aria-label': 'Title', id: 'posttitle' });
   const body = h('textarea', { rows: '12', maxlength: String(MAX.postBody), placeholder: 'Write your piece', 'aria-label': 'Your piece', id: 'postbody' });
   const err = h('p', { class: 'error small' });
@@ -518,7 +661,7 @@ function viewWrite() {
 
 function viewPost(id) {
   const head = h('div', { class: 'card pad', id: 'post' }), list = h('div', { class: 'card thread', id: 'messages' });
-  el.view.append(backTo('reading', 'Reading'), head, h('h3', {}, 'Discussion'), list, memberOf(S.pk) && id ? composer(id, false) : needSeat());
+  el.view.append(backTo('reading', 'Reading'), head, h('h3', {}, 'Discussion'), list, canSpeak() && id ? composer(id, false) : needSeat());
   let drawn = '';
   return {
     key: seatKey,
@@ -573,25 +716,51 @@ function viewYou() {
     h('div', { class: 'row' }, showBtn), wordsOut,
     h('label', { for: 'restorewords' }, 'Move an identity to this device'), restoreIn, h('div', { class: 'row' }, restoreBtn), rerr);
 
-  el.view.append(seatBox, hostBox, backup, listsBox,
-    h('p', { class: 'muted small note' }, 'Test build. Everything written here is public and permanent. Hosts can see your internet address; use Tor Browser if that matters.'));
+  // editions and quiet reading
+  const emsg = h('p', { class: 'muted small', id: 'editionmsg' });
+  const fileIn = h('input', { type: 'file', accept: '.json,application/json', id: 'openedition', 'aria-label': 'Open an edition file' });
+  fileIn.addEventListener('change', () => {
+    const f = fileIn.files && fileIn.files[0];
+    if (!f) return;
+    if (f.size > 30000000) { emsg.textContent = 'That file is too large to be an edition.'; return; }
+    f.text().then((t) => { let j = null; try { j = JSON.parse(t); } catch (e) { j = null; } emsg.textContent = loadEdition(j) || 'Edition opened. Every note in it was checked.'; fileIn.value = ''; });
+  });
+  const saveBtn = h('button', { id: 'saveedition', onclick: () => {
+    if (!S.net) { emsg.textContent = 'Nothing to save yet.'; return; }
+    emsg.textContent = 'Saved ' + saveEdition() + ' notes. Send the file to anyone, by any app.';
+  } }, 'Save an edition file');
+  const quietBtn = h('button', { id: 'quiet', 'aria-pressed': S.quiet ? 'true' : 'false', onclick: () => { store.set('fkn.quiet', S.quiet ? '0' : '1'); location.reload(); } },
+    S.quiet ? 'Turn quiet reading off' : 'Turn quiet reading on');
+  const editions = h('div', { class: 'card pad', id: 'editions' }, h('h2', {}, 'Editions'),
+    h('p', { class: 'muted small' }, 'An edition is one file holding this network\'s notes. It can travel by any messenger. Every note is checked when the file is opened, so it does not matter who passed it on.'),
+    h('div', { class: 'row' }, saveBtn), h('label', { for: 'openedition' }, 'Open an edition file'), fileIn, emsg,
+    h('h3', {}, 'Quiet reading'),
+    h('p', { class: 'muted small' }, 'While it is on, this device contacts no host and reads from editions only, so no host sees its internet address. The site this page loads from still does. You cannot speak until you turn it off.'),
+    h('div', { class: 'row' }, quietBtn));
+
+  el.view.append(seatBox, hostBox, editions, backup, listsBox,
+    h('p', { class: 'muted small note' }, 'Test build. Everything written here is public and permanent. To speak, your device contacts hosts, and they can see its internet address; use Tor Browser if that matters.'));
 
   return {
     refresh() {
       // seat
-      const mine = memberOf(S.pk), asked = S.joins.get(S.pk);
-      const key = mine ? 'm' + mine.name : asked ? 'w' + asked.name : 'r';
+      const mine = memberOf(S.pk), p = S.pending;
+      const key = mine ? 'm' + mine.name : S.quiet ? 'q' : p ? (p.cert ? 'g' : 'w') + p.code : 'r' + (S.net ? '1' : '0');
       if (key !== seatDrawn) {
         seatDrawn = key; seatBox.textContent = '';
         if (mine) seatBox.append(h('h2', {}, 'You are ', h('b', { id: 'myname' }, mine.name)), h('p', { class: 'muted small' }, 'You hold a seat. You can speak in every room, write, and vote.'));
-        else if (asked) seatBox.append(h('h2', {}, 'Waiting for a seat'), h('p', { class: 'muted small' }, 'If the host asks, your name is ', h('b', {}, asked.name), ' and your code is ', h('b', { id: 'code' }, S.pk.slice(0, 6)), '.'));
+        else if (S.quiet) seatBox.append(h('h2', {}, 'Reading quietly'), h('p', { class: 'muted small' }, 'Turn quiet reading off below to take a seat or speak.'));
+        else if (p && p.cert) seatBox.append(h('h2', { id: 'granted' }, 'Seat granted'), h('p', { class: 'muted small' }, 'It switches on within two minutes. Keep this page open. The wait keeps the host from matching your request to your name.'));
+        else if (p) seatBox.append(h('h2', {}, 'Waiting for the host'), h('p', { class: 'muted small' }, 'Tell the host this code, privately: ', h('b', { id: 'code' }, p.code), '. The host approves the code and never sees the name you picked.'),
+          h('div', { class: 'row' }, h('button', { id: 'startover', onclick: () => { S.pending = null; store.set('fkn.pending.' + S.cfg.s, 'null'); scheduleRefresh(); } }, 'Start over')));
         else {
           const input = h('input', { type: 'text', maxlength: '20', placeholder: 'river-42', 'aria-label': 'Pick a name', id: 'name', autocapitalize: 'none', autocomplete: 'off' });
           const err = h('p', { class: 'error small' });
           const ask = () => {
             const name = input.value.trim().toLowerCase();
             if (!NAME_RE.test(name)) { err.textContent = 'Use 3 to 20 small letters, numbers or hyphens.'; return; }
-            sign(K_JOIN, [], JSON.stringify({ name }));
+            if (!S.net) { err.textContent = 'Still looking for this network. Try again in a moment.'; return; }
+            askForSeat(name);
           };
           input.addEventListener('input', () => { err.textContent = ''; });
           seatBox.append(h('h2', {}, 'Take a seat'), h('p', { class: 'muted small' }, 'Reading is open to everyone. A seat lets you speak. One person, one seat.'),
@@ -601,24 +770,29 @@ function viewYou() {
       // host
       hostBox.textContent = '';
       if (S.isHost) {
-        const members = S.roster ? S.roster.members : {};
-        const pending = [...S.joins.entries()].filter(([pk]) => !members[pk] && !S.ignored.has(pk)).sort((a, b) => a[1].at - b[1].at);
+        const waiting = [...S.requests.entries()].filter(([id]) => !S.grants.has(id) && !S.ignored.has(id)).sort((a, b) => a[1].at - b[1].at);
         const link = inviteLink();
+        const untaken = Math.max(0, S.grants.size - (S.members.size - 1));   // grants handed out but not yet claimed
         const linkBox = h('input', { type: 'text', readonly: true, value: link, 'aria-label': 'Invite link', id: 'link' });
         const copied = h('span', { class: 'muted small' });
         const box = h('div', { class: 'card pad', id: 'host' }, h('h2', {}, 'You host this network'),
-          h('p', { class: 'muted small' }, Object.keys(members).length + ' seated. Share this link:'), linkBox,
+          h('p', { class: 'muted small', id: 'seated' }, S.members.size + ' seated. ' + (untaken ? untaken + (untaken === 1 ? ' seat' : ' seats') + ' granted and not yet taken. ' : '') + 'Share this link:'), linkBox,
           h('div', { class: 'row' }, h('button', { onclick: () => {
             linkBox.select();
             try { navigator.clipboard.writeText(link).then(() => { copied.textContent = 'Copied'; }, () => { copied.textContent = 'Select and copy it by hand'; }); }
             catch (e) { copied.textContent = 'Select and copy it by hand'; }
           } }, 'Copy link'), copied),
           h('p', { class: 'muted small' }, 'Network key: ', h('span', { class: 'mono', id: 'netkey' }, S.cfg.s)));
-        if (pending.length) box.append(h('h3', {}, 'Asking for a seat'));
-        for (const [pk, j] of pending) {
-          box.append(h('div', { class: 'ask' }, h('p', {}, h('b', {}, j.name), h('span', { class: 'muted' }, '  code ' + pk.slice(0, 6))),
-            h('div', { class: 'row' }, h('button', { class: 'primary approve', onclick: () => seat(pk, j.name) }, 'Seat them'),
-              h('button', { onclick: () => { S.ignored.add(pk); scheduleRefresh(); } }, 'Ignore'))));
+        if (waiting.length) box.append(h('h3', {}, 'Asking for a seat'), h('p', { class: 'muted small' }, 'Seat only the codes people gave you privately. You will not see which name a code becomes.'));
+        // A stranger can copy a code. If two requests show the same one, neither is safe to seat.
+        const codes = new Map();
+        for (const [, r] of waiting) codes.set(codeOf(r.pubkey), (codes.get(codeOf(r.pubkey)) || 0) + 1);
+        for (const [id, r] of waiting.slice(0, 50)) {
+          const code = codeOf(r.pubkey), clash = codes.get(code) > 1;
+          box.append(h('div', { class: 'ask' }, h('p', {}, 'Code ', h('b', { class: 'reqcode' }, code), h('span', { class: 'muted' }, '  ' + when(r.at))),
+            clash ? h('p', { class: 'error small clash' }, 'Two requests show this code. Seat neither. Ask the person to start over.') : null,
+            h('div', { class: 'row' }, clash ? null : h('button', { class: 'primary approve', onclick: () => grantSeat(id) }, 'Seat them'),
+              h('button', { class: 'ignore', onclick: () => { S.ignored.add(id); scheduleRefresh(); } }, 'Ignore'))));
         }
         hostBox.append(box);
       }
@@ -652,7 +826,8 @@ function viewSetup(base) {
     const cfg = { s: S.hostPk, relays: base.relays, custom: base.custom, fromFile: false };
     start(cfg);
     location.hash = hashFor('you');
-    publishRoster(net.value.trim(), { [S.pk]: { name: n } });
+    publishNet(net.value.trim());
+    publishClaim(n, signSeat(1, subject(S.pk, n), S.seatSk));   // the host's own seat, signed directly
   };
   [net, name].forEach((i) => i.addEventListener('input', () => { err.textContent = ''; }));
   app.append(h('header', {}, h('h1', {}, 'Start a network'),
@@ -667,21 +842,33 @@ function start(cfg) {
   S.cfg = cfg;
   S.T = 'fkn' + cfg.s.slice(0, 16);
   S.isHost = S.hostPk === cfg.s;
+  S.seatSk = S.isHost ? seatSecret(S.hostSk) : null;
+  S.fast = params().get('fast') === '1';            // testing only: claim a granted seat at once
+  S.quiet = store.get('fkn.quiet') === '1';
+  S.certOk = new Set(store.json('fkn.certok.' + cfg.s, []));
+  S.pending = store.json('fkn.pending.' + cfg.s, null);
   S.muted = new Set(store.json('fkn.mute.' + cfg.s, []));
   S.follow = new Set(store.json('fkn.follow.' + cfg.s, []));
   S.lastSeen = store.json('fkn.seen.' + cfg.s, {});
-  S.rosterDeadline = Date.now() + 2500;
+  S.netDeadline = Date.now() + 2500;
   buildShell();
   const filters = [
     { kinds: NOTE_KINDS, '#t': [S.T], limit: 2000 },
-    { kinds: [K_ROSTER], authors: [cfg.s], '#d': ['fkn:roster'] },
+    { kinds: [K_NET], authors: [cfg.s], '#d': ['fkn:net'] },
   ];
-  S.pool = new Pool(cfg.relays, filters, { event: incoming, status: scheduleRefresh });
+  S.pool = new Pool(S.quiet ? [] : cfg.relays, filters, { event: incoming, status: scheduleRefresh });
   if (S.isHost) {
-    // The host's browser keeps the member list and re-sends it to any relay that lost it.
-    const saved = store.json('fkn.roster.' + cfg.s, null);
-    if (saved) { S.seen.add(saved.id); takeRoster(saved); S.pool.publish(saved); }
+    // The host's browser keeps the network note and re-sends it to any relay that lost it.
+    const saved = store.json('fkn.net.' + cfg.s, null);
+    if (saved) { S.seen.add(saved.id); takeNet(saved); S.pool.publish(saved); }
   }
+  // The latest edition: a static file of signed notes. Each note is checked like any other,
+  // so the file needs no trust, and reading works even when no relay can be reached.
+  fetch('./editions/latest.json').then((r) => (r.ok ? r.json() : null)).then((j) => {
+    if (j) loadEdition(j);
+  }).catch(() => {});
+  // A granted seat that was never claimed (tab closed in between) is claimed after a short look around.
+  setTimeout(checkPending, 4000);
   mount();
   scheduleRefresh();
 }

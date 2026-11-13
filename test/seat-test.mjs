@@ -1,0 +1,24 @@
+import { seatSecret, seatPublic, blindSeat, signBlinded, unblindSeat, signSeat, verifySeat } from '../src/seat.js';
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+const hostSk = generateSecretKey();
+const sk = seatSecret(hostSk), sk2 = seatSecret(hostSk);
+const same = Buffer.from(sk).equals(Buffer.from(sk2));
+const pub = seatPublic(sk);
+const handle = getPublicKey(generateSecretKey()), other = getPublicKey(generateSecretKey());
+let t = performance.now();
+const { blinded, r } = blindSeat(1, handle); const tb = performance.now() - t; t = performance.now();
+const signed = signBlinded(blinded, sk); const ts = performance.now() - t; t = performance.now();
+const cert = unblindSeat(signed, r); const tu = performance.now() - t; t = performance.now();
+const ok = verifySeat(cert, 1, handle, pub); const tv = performance.now() - t;
+const direct = signSeat(1, handle, sk);
+console.log('deterministic host key:', same);
+console.log('valid cert verifies:', ok, '| equals direct signature:', cert === direct);
+console.log('wrong handle:', verifySeat(cert, 1, other, pub), '| wrong era:', verifySeat(cert, 2, handle, pub));
+console.log('wrong network key:', verifySeat(cert, 1, handle, seatPublic(seatSecret(generateSecretKey()))));
+console.log('blinded differs from cert and from signed:', blinded !== cert && signed !== cert);
+console.log('two blindings of same handle differ:', blindSeat(1, handle).blinded !== blinded);
+console.log('garbage cert:', verifySeat('00'.repeat(48), 1, handle, pub), verifySeat('zz', 1, handle, pub));
+let threw = false; try { signBlinded('c0' + '00'.repeat(47), sk); } catch { threw = true; }
+console.log('host refuses the zero point:', threw);
+console.log('sizes: cert', cert.length / 2, 'bytes, seat key', pub.length / 2, 'bytes');
+console.log('ms: blind', tb.toFixed(0), 'sign', ts.toFixed(0), 'unblind', tu.toFixed(0), 'verify', tv.toFixed(0));
